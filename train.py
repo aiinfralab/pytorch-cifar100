@@ -65,10 +65,10 @@ def train(epoch):
         if epoch <= args.warm:
             warmup_scheduler.step()
 
-    for name, param in net.named_parameters():
-        layer, attr = os.path.splitext(name)
-        attr = attr[1:]
-        writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
+    #for name, param in net.named_parameters():
+    #    layer, attr = os.path.splitext(name)
+    #    attr = attr[1:]
+    #    writer.add_histogram("{}/{}".format(layer, attr), param, epoch)
 
     finish = time.time()
 
