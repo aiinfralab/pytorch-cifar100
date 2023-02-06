@@ -176,12 +176,13 @@ def main():
 
     cudnn.benchmark = True
     stime = time.time()
+    scaler = torch.cuda.amp.GradScaler()
     for epoch in range(0, args.epochs):
 
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        train_loss = train(train_loader, model, criterion, optimizer, epoch)
+        train_loss = train(train_loader, model, criterion, optimizer, epoch,scaler)
 
         # evaluate on validation set
         err1, err5, val_loss = validate(val_loader, model, criterion, epoch)
@@ -206,13 +207,12 @@ def main():
     print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch,scaler):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
-
     # switch to train mode
     model.train()
 
@@ -224,9 +224,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         input = input.cuda()
         target = target.cuda()
-        output = model(input)
-        loss = criterion(output, target)
-
+        with torch.cuda.amp.autocast():
+            output = model(input)
+            loss = criterion(output, target)
+        # output = model(input)
+        # loss = criterion(output, target)
         # measure accuracy and record loss
         err1, err5 = accuracy(output.data, target, topk=(1, 5))
 
@@ -236,8 +238,13 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # loss.backward()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # scaler.unscale_(optimizer)
+
+        # optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
