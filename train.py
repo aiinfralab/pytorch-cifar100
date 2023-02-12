@@ -20,6 +20,8 @@ import pyramidnet as PYRM
 import utils
 import numpy as np
 
+import torch.multiprocessing as mp
+import builtins
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -33,34 +35,57 @@ parser.add_argument('--net_type', default='pyramidnet', type=str,
                     help='networktype: resnet, and pyamidnet')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=1, type=int, metavar='N',
                     help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch_size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.25, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
-parser.add_argument('--print-freq', '-p', default=1, type=int,
+parser.add_argument('--print-freq', '-p', default=1000, type=int,
                     metavar='N', help='print frequency (default: 10)')
-parser.add_argument('--depth', default=32, type=int,
+parser.add_argument('--depth', default=200, type=int,
                     help='depth of the network (default: 32)')
 parser.add_argument('--no-bottleneck', dest='bottleneck', action='store_false',
                     help='to use basicblock for CIFAR datasets (default: bottleneck)')
-parser.add_argument('--dataset', dest='dataset', default='imagenet', type=str,
+parser.add_argument('--dataset', dest='dataset', default='cifar100', type=str,
                     help='dataset (options: cifar10, cifar100, and imagenet)')
 parser.add_argument('--no-verbose', dest='verbose', action='store_false',
                     help='to print the status at every iteration')
-parser.add_argument('--alpha', default=300, type=float,
+parser.add_argument('--alpha', default=240, type=float,
                     help='number of new channel increases per depth (default: 300)')
-parser.add_argument('--expname', default='TEST', type=str,
+parser.add_argument('--expname', default='PyraNet200', type=str,
                     help='name of experiment')
-parser.add_argument('--beta', default=0, type=float,
+parser.add_argument('--beta', default=1.0, type=float,
                     help='hyperparameter beta')
-parser.add_argument('--cutmix_prob', default=0, type=float,
+parser.add_argument('--cutmix_prob', default=0.5, type=float,
                     help='cutmix probability')
+
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+
+parser.add_argument('--world-size', default=-1, type=int,
+                    help='number of nodes for distributed training')
+parser.add_argument('--rank', default=0, type=int,
+                    help='node rank for distributed training')
+parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--dist-backend', default='gloo', type=str,
+                    help='distributed backend')
+parser.add_argument('--seed', default=None, type=int,
+                    help='seed for initializing training. ')
+parser.add_argument('--gpu', default=None, type=int,
+                    help='GPU id to use.')
+parser.add_argument('--multiprocessing-distributed', action='store_true',
+                    help='Use multi-processing distributed training to launch '
+                         'N processes per node, which has N GPUs. This is the '
+                         'fastest way to use PyTorch for either single node or '
+                         'multi node data parallel training')
 
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=True)
@@ -68,11 +93,111 @@ parser.set_defaults(verbose=True)
 best_err1 = 100
 best_err5 = 100
 
-
-def main():
-    global args, best_err1, best_err5
+def main(): 
     args = parser.parse_args()
 
+    print("dist backend : ", args.dist_backend)
+
+    if args.dist_url=='env://' and args.world_size==-1:
+        args.world_size=int(os.environ['WORLD_SIZE']) # 현재는 에러뜸
+    
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    ngpus_per_node = torch.cuda.device_count()
+
+    print("Available GPU No. : ", ngpus_per_node)
+
+    if args.multiprocessing_distributed:
+        args.world_size=ngpus_per_node*args.world_size
+        mp.spawn(main_worker,nprocs=ngpus_per_node,args=(ngpus_per_node,args))
+    else:
+        main_worker(args.gpu,ngpus_per_node,args)    
+
+
+def main_worker(gpu,ngpus_per_node, args):
+    # 내용1 :gpu 설정
+    args.gpu = gpu
+
+    global best_err1, best_err5
+
+    if args.multiprocessing_distributed and args.gpu !=0:
+        def print_pass(*args):
+            pass
+        builtins.print=print_pass
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
+    
+    if args.distributed:
+        if args.dist_url=='env://' and args.rank==-1:
+            args.rank=int(os.environ["RANK"])
+        if args.multiprocessing_distributed:
+            args.rank=args.rank*ngpus_per_node + gpu #gpu None아님?
+        torch.distributed.init_process_group(backend=args.dist_backend,init_method=args.dist_url,
+                                            world_size=args.world_size,rank=args.rank)
+    # 내용2: model 정의
+    print("=> creating model '{}'".format(args.net_type))
+    if args.dataset == 'cifar100':
+        numberofclass = 100
+    elif args.dataset == 'cifar10':
+        numberofclass = 10
+    if args.net_type == 'resnet':
+        model = RN.ResNet(args.dataset, args.depth, numberofclass, args.bottleneck)  # for ResNet
+    elif args.net_type == 'pyramidnet':
+        model = PYRM.PyramidNet(args.dataset, args.depth, args.alpha, numberofclass,
+                                args.bottleneck)
+    else:
+        raise Exception('unknown network architecture: {}'.format(args.net_type))
+    # 내용3: multiprocess 설정
+    if args.distributed:
+        if args.gpu is not None:
+            torch.cuda.set_device(args.gpu)
+            model.cuda(args.gpu)
+            # when using a single GPU per process and per DDP, we need to divide tha batch size
+            # ourselves based on the total number of GPUs we have
+            args.batch_size = int(args.batch_size / ngpus_per_node)
+            args.workers = int((args.workers+ngpus_per_node-1)/ngpus_per_node)
+            # 내용3-1: model ddp설정
+            model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[args.gpu])# args.gpu가 무슨 값인지 알고 싶다.
+        else:
+            model.cuda()
+            # DDP will divide and allocate batch_size to all available GPUs if device_ids are not set
+            # 만약에 device_ids를 따로 설정해주지 않으면, 가능한 모든 gpu를 기준으로 ddp가 알아서 배치사이즈와 workers를 나눠준다는 뜻.
+            model = torch.nn.parallel.DistributedDataParallel(model)
+    elif args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        model=model.cuda(args.gpu)
+        raise NotImplementedError("Only DistributedDataParallel is supported.")
+    else:
+        raise NotImplementedError("Only DistributedDataparallel is supported.")
+
+    # 내용4: criterion / optimizer 정의
+    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay, nesterov=True)
+
+    # 옵션1: resume 방법
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint: '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # MAP model to be loaded to specific single gpu.
+                loc = 'cuda:{}'.format(args.gpu)
+                checkpoint = torch.load(args.resume, map_location=loc)
+            args.start_epoch = checkpoint['epoch']
+            model.load_state_dict((checkpoint['state_dict']))
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                    .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+    
+    cudnn.benchmark = True # 얘는 뭐하는 거지?
+    
+    # 내용5: 데이터 로딩
+    # 내용5-1: transform 정의
     if args.dataset.startswith('cifar'):
         normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                                          std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
@@ -88,103 +213,50 @@ def main():
             transforms.ToTensor(),
             normalize
         ])
-
+        # 내용5-2: dataset 정의
         if args.dataset == 'cifar100':
-            train_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR100('../data', train=True, download=True, transform=transform_train),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-            val_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR100('../data', train=False, transform=transform_test),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            train_dataset = datasets.CIFAR100('../data', train=True, download=True, transform=transform_train)
+            val_dataset = datasets.CIFAR100('../data', train=False, transform=transform_test)
             numberofclass = 100
         elif args.dataset == 'cifar10':
-            train_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR10('../data', train=True, download=True, transform=transform_train),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-            val_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR10('../data', train=False, transform=transform_test),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            train_dataset = datasets.CIFAR10('../data', train=True, download=True, transform=transform_train)
+            val_dataset = datasets.CIFAR10('../data', train=False, transform=transform_test)
             numberofclass = 10
+            
+        # 내용5-3: sampler 정의 (참고: val_loader는 sampler를 사용하지 않는다.)
+        if args.distributed:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         else:
-            raise Exception('unknown dataset: {}'.format(args.dataset))
-
-    elif args.dataset == 'imagenet':
-        traindir = os.path.join('/home/data/ILSVRC/train')
-        valdir = os.path.join('/home/data/ILSVRC/val')
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-
-        jittering = utils.ColorJitter(brightness=0.4, contrast=0.4,
-                                      saturation=0.4)
-        lighting = utils.Lighting(alphastd=0.1,
-                                  eigval=[0.2175, 0.0188, 0.0045],
-                                  eigvec=[[-0.5675, 0.7192, 0.4009],
-                                          [-0.5808, -0.0045, -0.8140],
-                                          [-0.5836, -0.6948, 0.4203]])
-
-        train_dataset = datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                jittering,
-                lighting,
-                normalize,
-            ]))
-
-        train_sampler = None
+            train_sampler = None
 
         train_loader = torch.utils.data.DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
+            train_dataset,
+            batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, pin_memory=True,sampler=train_sampler)
         val_loader = torch.utils.data.DataLoader(
-            datasets.ImageFolder(valdir, transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize,
-            ])),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True)
-        numberofclass = 1000
+            val_dataset,
+            batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+
 
     else:
         raise Exception('unknown dataset: {}'.format(args.dataset))
 
-    print("=> creating model '{}'".format(args.net_type))
-    if args.net_type == 'resnet':
-        model = RN.ResNet(args.dataset, args.depth, numberofclass, args.bottleneck)  # for ResNet
-    elif args.net_type == 'pyramidnet':
-        model = PYRM.PyramidNet(args.dataset, args.depth, args.alpha, numberofclass,
-                                args.bottleneck)
-    else:
-        raise Exception('unknown network architecture: {}'.format(args.net_type))
-
-    # model = torch.nn.DataParallel(model).cuda()
-    model = model.cuda()
-    print(model)
-    print('the number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
-
-    # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay, nesterov=True)
-
+    # 내용 6: for문을 통한 training
     cudnn.benchmark = True
     stime = time.time()
-    for epoch in range(0, args.epochs):
-
-        adjust_learning_rate(optimizer, epoch)
+    for epoch in range(args.start_epoch, args.epochs):
+        # 내용 6-1: train_sampler.set_epoch
+        # In distributed mode, calling the set_eopch() method at the beggining of 
+        # each epoch before creating the "dataloader" iterator is necessary to make
+        # suffling work properly across multiple epochs. Otherwise, the same ordering will be always used.
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
+        adjust_learning_rate(optimizer, epoch,args)
 
         # train for one epoch
-        train_loss = train(train_loader, model, criterion, optimizer, epoch)
+        train_loss = train(train_loader, model, criterion, optimizer, epoch,args)
 
         # evaluate on validation set
-        err1, err5, val_loss = validate(val_loader, model, criterion, epoch)
+        err1, err5, val_loss = validate(val_loader, model, criterion, epoch,args)
 
         # remember best prec@1 and save checkpoint
         is_best = err1 <= best_err1
@@ -192,21 +264,23 @@ def main():
         if is_best:
             best_err5 = err5
 
-        print('Current best accuracy (top-1 and 5 error):', best_err1, best_err5)
-        save_checkpoint({
-            'epoch': epoch,
-            'arch': args.net_type,
-            'state_dict': model.state_dict(),
-            'best_err1': best_err1,
-            'best_err5': best_err5,
-            'optimizer': optimizer.state_dict(),
-        }, is_best)
+#        print('Current best accuracy (top-1 and 5 error):', best_err1, best_err5)
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank% ngpus_per_node == 0):
+            save_checkpoint({
+                'epoch': epoch,
+                'arch': args.net_type,
+                'state_dict': model.state_dict(),
+                'best_err1': best_err1,
+                'best_err5': best_err5,
+                'optimizer': optimizer.state_dict(),
+            }, is_best,args=args)
     etime = time.time()
-    print("총 걸린시간: ",etime-stime)
-    print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+        print("총 걸린시간: ",etime-stime)
+        print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch,args):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -260,7 +334,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     return losses.avg
 
 
-def validate(val_loader, model, criterion, epoch):
+def validate(val_loader, model, criterion, epoch,args):
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -302,7 +376,7 @@ def validate(val_loader, model, criterion, epoch):
     return top1.avg, top5.avg, losses.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best,args, filename='checkpoint.pth.tar'):
     directory = "runs/%s/" % (args.expname)
     if not os.path.exists(directory):
         os.makedirs(directory)
@@ -331,7 +405,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch,args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     if args.dataset.startswith('cifar'):
         lr = args.lr * (0.1 ** (epoch // (args.epochs * 0.5))) * (0.1 ** (epoch // (args.epochs * 0.75)))
@@ -363,7 +437,7 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
         wrong_k = batch_size - correct_k
         res.append(wrong_k.mul_(100.0 / batch_size))
 
